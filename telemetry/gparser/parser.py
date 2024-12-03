@@ -7,6 +7,10 @@ import junitparser
 import telemetry
 from junitparser import JUnitXml, Skipped, Error, Failure
 import xml.etree.ElementTree as ET
+import ast
+from bs4 import BeautifulSoup
+import asyncio
+import aiohttp
 
 def get_parser(url,grabber=None):
     '''Factory method that provides appropriate parser object base on given url'''
@@ -262,42 +266,143 @@ class pytestxml_parser(xmlParser):
                 test_name = testcase.get("name")
                 # Find the properties tag
                 properties = testcase.find("properties")
-                failure = testcase.find("failure")
-                error = testcase.find("error")
-                skipped = testcase.find("skipped")
+                # Find the failure tag
+                failure = testcase.find("failure")    
+
+                # Test description links from pyadi-iio
+                attr_link = "https://analogdevicesinc.github.io/pyadi-iio/dev/test_attr.html"
+                dma_link = "https://analogdevicesinc.github.io/pyadi-iio/dev/test_dma.html"
+                generic_link = "https://analogdevicesinc.github.io/pyadi-iio/dev/test_generics.html"
+                # Set default description link for all tests
+                test_name_link = f"[{test_name}]({attr_link})"    
+
+                url_links = [attr_link, dma_link, generic_link]
+
+                # Get parameters from test case name
+                param_parsed = test_name.split("[", 1)
+                test_name = param_parsed[0]
+                param_parsed_last = (param_parsed[-1])[:-1].strip()
+                # Separate the parameters
+                param_separate = re.split(r'-(?!\d)', param_parsed_last)
+                # Check parameters list for a dictionary named "param_set"
+                for index, param in enumerate(param_separate):
+                    # Check if param_set parameter name exists
+                    if "param_set" in param:
+                        param_list = []
+                        # Remove param_set= in string
+                        new_param = param[len("param_set="):].strip()
+                        # Check if param is a dictionary and not empty
+                        if new_param[0] == "{" and new_param != "\{\}":
+                            # Convert remaining string to a dictionary
+                            param_dict = ast.literal_eval(new_param)
+                            if param_dict:
+                                for key, value in param_dict.items():
+                                    # Convert parameters of param_set back to string
+                                    new_updated = "'" + key + "'" + ": " + str(value)
+                                    param_list.append(new_updated)
+                                param_list.insert(0, "param_set=")
+                                param_list_string = "   \n".join(param_list)
+                                # Update param in param_separate list
+                                param_separate[index] = param_list_string 
+                # Compile final parameter details
+                param_separate.insert(0,"**Parameters:**")
+                param_display = "\n  - ".join(param_separate) 
 
                 if properties is not None:
                     if  failure is not None:
-                        # failure tag content
+                        # Get failure tag content
                         failure_text = failure.text
                         fail_content_lines = failure_text.splitlines()
-                        fail_line_statement = fail_content_lines[-4]
-                        # exception statement with parameter names
-                        exc_param_value = (fail_line_statement[1:]).lstrip()
-                        fail_content_list = failure_text.split("@", 1)
-                        param_test = ""
-                        if len(fail_content_list) > 0:
-                            # test parameters and values
-                            param_test = fail_content_list[0]
+                        exc_param_value = ""
+                        # Get exception statement with parameter names
+                        for item in fail_content_lines[::-1]:
+                            if len(item) > 0:
+                                if item[0] == ">":
+                                    exc_param_value = item[1:].lstrip()
+                                    break                        
+                                                                     
                         test_desc = ""
-
+                        exctype_message = ""
                         # Iterate through each property in the properties tag
                         for prop in properties.findall("property"):
                             # Get the property name and value
                             prop_name = prop.get("name")
                             prop_value = prop.get("value")
-                            if prop_name == "exception_type_and_message":
-                                # update test name with exception type and value
-                                test_name = test_name + ": " + prop_value + " (" + exc_param_value + ")"
+                            if prop_name == "exception_type_and_message":                                                             
+                                prop_list = prop_value.splitlines() 
+                                new_props = prop_value
+                                prop_list_updated = []
+                                # Check if exception and message has mutiple lines  
+                                if len(prop_list) > 1:
+                                    for props in prop_list:
+                                        if len(props) > 0:
+                                            # Remove leading spaces
+                                            prop_strip = props.lstrip()
+                                            prop_list_updated.append(prop_strip)                                        
+                                if len(prop_list_updated) > 0:
+                                    new_props = " ".join(prop_list_updated)                                            
+                                # Combine exception type, message, and parameters        
+                                exctype_message =  "\n" + "  " + new_props + " ( " + exc_param_value + " )"
                             if prop_name == "test_description":
-                                # test description
+                                # Get test description
                                 test_desc = prop_value
-                        test_details = [test_name, param_test, test_desc] 
-                        payload.append(test_details) 
-                    elif error is not None:
-                        payload.append(test_name)
-                    elif skipped is not None:
-                        payload.append(test_name)
+
+                            # Get test name from test description
+                            if test_desc != "":
+                                test_desc_split = test_desc.split(":")
+                                if len(test_desc_split) > 0:
+                                    test_desc_name = test_desc_split[0].strip()   
+
+                                    # Search test name from description on pyad-iio test description links
+                                    timeout_value = 5  # Timeout after 5 seconds for fetching URL
+                                    
+                                    # Asynchronous function to fetch and process the URL
+                                    async def fetch_and_process(url, session):                                        
+                                        try:
+                                            async with session.get(url, timeout=timeout_value) as response:
+                                                if response.status == 200:
+                                                    page_content = await response.text()
+
+                                                    # Parse the page content with BeautifulSoup
+                                                    soup = BeautifulSoup(page_content, 'html.parser')
+
+                                                    # Find all <dt> tags with the specific target class
+                                                    dt_tags = soup.find_all('dt', class_='sig sig-object py')
+
+                                                    for dt in dt_tags:
+                                                        # Find all links in dt tags
+                                                        links = dt.find_all('a', href=True)
+                                                        for link in links:
+                                                            href = link['href']
+                                                            href_parsed = href.split(".")
+                                                            if len(href_parsed) > 0:
+                                                                # Get test name from link
+                                                                href_test_name = href_parsed[-1]
+                                                                # Compare link test name to test name from description                                                             
+                                                                if href_test_name == test_desc_name:
+                                                                    test_permalink = url + href
+                                                                    return f"[{test_name}]({test_permalink})"
+                                        except Exception as e:
+                                            print(f"Error with URL {url}: {e}")
+
+                                    # Main asynchronous function to handle all URLs concurrently
+                                    async def main():
+                                        async with aiohttp.ClientSession() as session:
+                                            tasks = [fetch_and_process(url, session) for url in url_links]
+                                            results = await asyncio.gather(*tasks)
+                                            return [result for result in results if result]
+
+                                    # Run the asynchronous code
+                                    test_name_link = asyncio.run(main())
+                                    if test_name_link:
+                                        test_name_link = test_name_link[0]                    
+
+                        # Compile the test details
+                        test_details = [test_name_link, param_display]
+                        test_details_final = "<br><br>".join(test_details) 
+                        test_details_final = test_details_final + "\n\n" + exctype_message
+
+                        payload.append(test_details_final)
             
         except Exception as ex:
             traceback.print_exc()
